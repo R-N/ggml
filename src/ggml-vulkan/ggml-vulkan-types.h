@@ -622,6 +622,7 @@ enum rms_norm_mode {
     RMS_NORM_MUL_ROPE,
     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
     RMS_NORM_VIEW_SET_ROWS,
+    RMS_NORM_MUL_ROPE_APPLY,
     RMS_NORM_COUNT,
 };
 
@@ -849,8 +850,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
+    vk_pipeline pipeline_group_norm_mul_add_f32;
+    vk_pipeline pipeline_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
+    vk_pipeline pipeline_rms_norm_f32_small, pipeline_rms_norm_mul_f32_small;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
@@ -869,6 +873,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_expm1[2];
     vk_pipeline pipeline_elu[2];
     vk_pipeline pipeline_gelu[2];
+    vk_pipeline pipeline_gelu_f32_f16;
     vk_pipeline pipeline_gelu_erf[2];
     vk_pipeline pipeline_gelu_quick[2];
     vk_pipeline pipeline_silu[2];
@@ -924,6 +929,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_large3_f32, pipeline_soft_max_large3_f32_f16;
 
     vk_pipeline pipeline_rope_apply_f32;
+    vk_pipeline pipeline_rms_norm_mul_rope_apply_f32;
+    vk_pipeline pipeline_norm_mul_add_f16;
+    vk_pipeline pipeline_rms_norm_mul_rope_apply_f16;
     vk_pipeline pipeline_rope_norm_f32, pipeline_rope_norm_f16, pipeline_rope_norm_f32_f16;
     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;

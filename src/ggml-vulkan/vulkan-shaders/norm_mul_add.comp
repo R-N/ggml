@@ -1,0 +1,74 @@
+#version 450
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#define BLOCK_SIZE 256
+
+// norm(x) * w + b over contiguous rows, w and b have one value per column.
+// KX = row length, KY = number of rows, param1 = eps
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer W {A_TYPE data_w[];};
+layout (binding = 2) readonly buffer B {A_TYPE data_b[];};
+layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
+
+shared vec2 sum[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    if (row >= p.KY) {
+        return;
+    }
+    const uint ncols = p.KX;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = row * ncols;
+
+    // rows up to CACHED * BLOCK_SIZE columns stay in registers between the statistics and the output pass
+    const uint CACHED = 2048 / BLOCK_SIZE;
+    float xr[CACHED];
+    const bool cached = ncols <= CACHED * BLOCK_SIZE;
+
+    vec2 s = vec2(0.0f);
+    if (cached) {
+        [[unroll]] for (uint k = 0; k < CACHED; k++) {
+            const uint i0 = tid + k * BLOCK_SIZE;
+            xr[k] = i0 < ncols ? float(data_a[base + i0]) : 0.0f;
+            s += vec2(xr[k], xr[k] * xr[k]);
+        }
+    } else {
+        for (uint i0 = tid; i0 < ncols; i0 += BLOCK_SIZE) {
+            const float xi = float(data_a[base + i0]);
+            s += vec2(xi, xi * xi);
+        }
+    }
+    sum[tid] = s;
+
+    barrier();
+    [[unroll]] for (int st = BLOCK_SIZE / 2; st > 0; st >>= 1) {
+        if (tid < st) {
+            sum[tid] += sum[tid + st];
+        }
+        barrier();
+    }
+
+    const float mean = sum[0].x / ncols;
+    const float var = sum[0].y / ncols - mean * mean;
+    const float inv_std = inversesqrt(var + p.param1);
+
+    if (cached) {
+        [[unroll]] for (uint k = 0; k < CACHED; k++) {
+            const uint i0 = tid + k * BLOCK_SIZE;
+            if (i0 < ncols) {
+                data_d[base + i0] = D_TYPE((xr[k] - mean) * inv_std * float(data_w[i0]) + float(data_b[i0]));
+            }
+        }
+    } else {
+        for (uint i0 = tid; i0 < ncols; i0 += BLOCK_SIZE) {
+            data_d[base + i0] = D_TYPE((float(data_a[base + i0]) - mean) * inv_std * float(data_w[i0]) + float(data_b[i0]));
+        }
+    }
+}

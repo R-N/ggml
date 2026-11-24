@@ -8032,6 +8032,160 @@ struct test_group_norm_mul_add : public test_case {
     }
 };
 
+// LayerNorm with per-column gamma/beta, as in SD transformer blocks
+struct test_norm_affine : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_AFFINE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_norm_affine(std::array<int64_t, 4> ne = {320, 4096, 1, 1}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(a, "a"); ggml_set_name(w, "w"); ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_norm(ctx, a, 1e-5f);
+        out = ggml_mul_inplace(ctx, out, w);
+        out = ggml_add_inplace(ctx, out, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// MUL_MAT followed by an in-place bias add, as built by sd.cpp for linear layers and im2col conv
+struct test_mul_mat_bias : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t m, n, k;
+    const int64_t w; // > 0: view the output as [w, m/w, n, 1] and add a per-n bias, like conv2d
+    const int64_t batch;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_BIAS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, type_b, m, n, k, w, batch);
+    }
+
+    test_mul_mat_bias(ggml_type type_a = GGML_TYPE_F16, ggml_type type_b = GGML_TYPE_F32,
+                      int64_t m = 320, int64_t n = 4096, int64_t k = 320, int64_t w = 0, int64_t batch = 1)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), w(w), batch(batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k, m, batch);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n, batch);
+        ggml_set_name(a, "a"); ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_tensor * bias;
+        if (w > 0) {
+            bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+            ggml_set_name(bias, "bias");
+            out  = ggml_reshape_4d(ctx, out, w, m / w, n, 1);
+            bias = ggml_reshape_4d(ctx, bias, 1, 1, n, 1);
+        } else {
+            bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            ggml_set_name(bias, "bias");
+        }
+        out = ggml_add_inplace(ctx, out, bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// DiT gated residual as built by sd.cpp: residual + mul_mat * per-channel gate (gelu: an unfused control case)
+struct test_mul_mat_epi : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t m, n, k;
+    const bool gelu;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_EPI";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, type_b, m, n, k, gelu);
+    }
+
+    test_mul_mat_epi(ggml_type type_a = GGML_TYPE_F16, ggml_type type_b = GGML_TYPE_F32,
+                     int64_t m = 256, int64_t n = 96, int64_t k = 128, bool gelu = false)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), gelu(gelu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n, 1);
+        ggml_set_name(a, "a"); ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        if (gelu) {
+            out = ggml_gelu_inplace(ctx, out);
+        } else {
+            ggml_tensor * gate  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, 1, 1);
+            ggml_tensor * resid = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n, 1);
+            ggml_set_name(gate, "gate"); ggml_set_name(resid, "resid");
+            out = ggml_add(ctx, resid, ggml_mul(ctx, out, gate));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GROUP_NORM with per-channel gamma/beta and optional SiLU, as in SD UNet ResBlocks
+struct test_group_norm_affine : public test_case {
+    const std::array<int64_t, 4> ne;
+    int num_groups;
+    bool silu;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GROUP_NORM_AFFINE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, num_groups, silu);
+    }
+
+    test_group_norm_affine(std::array<int64_t, 4> ne = {64, 64, 320, 1}, int num_groups = 32, bool silu = false)
+        : ne(ne), num_groups(num_groups), silu(silu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], 1);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], 1);
+        ggml_set_name(a, "a"); ggml_set_name(w, "w"); ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_group_norm(ctx, a, num_groups, 1e-6f);
+        out = ggml_mul_inplace(ctx, out, w);
+        out = ggml_add_inplace(ctx, out, b);
+        if (silu) {
+            out = ggml_silu_inplace(ctx, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_L2_NORM x N: independent same-shape norms in one graph (strided qkv views or
 // contiguous), consuming adds nested so the norms stay adjacent in the graph.
 struct test_l2_norm_batch : public test_case {
@@ -11526,6 +11680,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {9, 9, 1280, 1}));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {9, 9, 1280, 1}));
+    for (int64_t n : {320, 1280, 1025}) {
+        test_cases.emplace_back(new test_norm_affine({n, 77, 2, 1}));
+    }
+    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat_bias(ta, GGML_TYPE_F32, 320, 4096, 320));
+        test_cases.emplace_back(new test_mul_mat_bias(ta, GGML_TYPE_F32, 768, 77, 768));
+        test_cases.emplace_back(new test_mul_mat_bias(ta, GGML_TYPE_F32, 1000, 33, 129, 0, 3));
+        test_cases.emplace_back(new test_mul_mat_bias(ta, GGML_TYPE_F32, 128, 128, 8192));
+        test_cases.emplace_back(new test_mul_mat_bias(ta, GGML_TYPE_F16, 4096, 320, 2880, 64));
+        test_cases.emplace_back(new test_mul_mat_bias(ta, GGML_TYPE_F16, 63 * 5, 130, 1152, 63));
+        test_cases.emplace_back(new test_mul_mat_bias(ta, GGML_TYPE_F16, 64, 64, 9216, 8));
+        for (bool gelu : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_epi(ta, GGML_TYPE_F32, 256, 96, 128, gelu));
+            test_cases.emplace_back(new test_mul_mat_epi(ta, GGML_TYPE_F32, 2048, 300, 2048, gelu));  // DiT-like, partial tiles
+            test_cases.emplace_back(new test_mul_mat_epi(ta, GGML_TYPE_F32, 1000, 33, 129, gelu));
+            test_cases.emplace_back(new test_mul_mat_epi(ta, GGML_TYPE_F32, 128, 128, 8192, gelu));   // split_k candidate
+        }
+    }
+    for (bool silu : {false, true}) {
+        test_cases.emplace_back(new test_group_norm_affine({64, 64, 320, 1}, 32, silu));
+        test_cases.emplace_back(new test_group_norm_affine({9, 9, 1280, 2}, 32, silu));
+        test_cases.emplace_back(new test_group_norm_affine({7, 5, 64, 3}, 8, silu));
+    }
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));
@@ -12044,6 +12221,67 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // SD1.5 UNet shapes at 512x512 (latent 64x64), selected with SD_UNET_PERF=1
+    if (getenv("SD_UNET_PERF")) {
+        // conv as im2col + mul_mat: m = OH*OW, n = Cout, k = Cin*9 (both f16)
+        for (auto [m, n, k] : std::vector<std::array<int64_t, 3>>{
+                 {4096, 320, 2880}, {1024, 640, 5760}, {256, 1280, 11520}, {64, 1280, 11520},
+                 {4096, 320, 5760}, {1024, 640, 11520}, {256, 1280, 23040}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, m, n, k, {1, 1}, {1, 1}));
+        }
+        // linear layers: f16 weights x f32 activations
+        for (auto [m, n, k] : std::vector<std::array<int64_t, 3>>{
+                 {320, 4096, 320}, {640, 1024, 640}, {1280, 256, 1280}, {2560, 4096, 320},
+                 {320, 4096, 1280}, {5120, 1024, 640}, {10240, 256, 1280}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        // Anima linear layers (hidden 2048, MLP 8192) at 1536 tokens (512x768) and 5520 tokens (920x1536)
+        for (int64_t t : {1536, 5520}) {
+            for (auto [m, k] : std::vector<std::array<int64_t, 2>>{{2048, 2048}, {8192, 2048}, {2048, 8192}}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, t, k, {1, 1}, {1, 1}));
+            }
+            // f16 input, as Anima casts the inputs of its linear layers
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 2048, t, 2048, {1, 1}, {1, 1}));
+        }
+        // Anima TAE (taew2_1) decoder convolutions on 128px tiles
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {256, 256, 64, 1}, {3, 3, 64, 64}));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {128, 64, 128, 1}, {3, 3, 128, 64}));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {128, 64, 64, 1}, {3, 3, 64, 64}));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {32, 32, 128, 1}, {3, 3, 128, 128}));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {16, 16, 256, 1}, {3, 3, 256, 256}));
+        // self- and cross-attention
+        test_cases.emplace_back(new test_flash_attn_ext(40, 40, 8, {1, 1}, 4096, 4096, false, false, 0.0f, 0.0f, GGML_PREC_DEFAULT));
+        test_cases.emplace_back(new test_flash_attn_ext(40, 40, 8, {1, 1}, 77,   4096, false, false, 0.0f, 0.0f, GGML_PREC_DEFAULT));
+        test_cases.emplace_back(new test_flash_attn_ext(80, 80, 8, {1, 1}, 1024, 1024, false, false, 0.0f, 0.0f, GGML_PREC_DEFAULT));
+        test_cases.emplace_back(new test_flash_attn_ext(160, 160, 8, {1, 1}, 256, 256, false, false, 0.0f, 0.0f, GGML_PREC_DEFAULT));
+        // Anima (Cosmos DiT): head 128, 16 heads; self-attention at 512x768 and 920x1536, cross-attention to text
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 16, {1, 1}, 1536, 1536, false, false, 0.0f, 0.0f, GGML_PREC_F32));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 16, {1, 1}, 512, 1536, false, false, 0.0f, 0.0f, GGML_PREC_F32));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 16, {1, 1}, 5520, 5520, false, false, 0.0f, 0.0f, GGML_PREC_F32));
+        // SDXL UNet at 832x1216: FFN down at latent /4 and /2, a full-resolution conv; and two shapes that run well, as a check
+        for (auto [m, n, k] : std::vector<std::array<int64_t, 3>>{
+                 {1280, 988, 5120}, {640, 3952, 2560}, {15808, 320, 8640}, {10240, 988, 1280}, {988, 1280, 11520}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        // SDXL UNet: head 64; self-attention at 832x1216 (latent /2 and /4) and cross-attention to 77 text tokens
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 10, {1, 1}, 3952, 3952, false, false, 0.0f, 0.0f, GGML_PREC_F32));
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 20, {1, 1}, 988, 988, false, false, 0.0f, 0.0f, GGML_PREC_F32));
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 20, {1, 1}, 77, 988, false, false, 0.0f, 0.0f, GGML_PREC_F32));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {64, 64, 320, 1}, {3, 3, 320, 1}));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {16, 16, 1280, 1}, {3, 3, 1280, 1}));
+        test_cases.emplace_back(new test_conv_2d({64, 64, 320, 1}, {3, 3, 320, 320}, GGML_TYPE_F16, 1, 1, 1, 1));
+        test_cases.emplace_back(new test_conv_2d({16, 16, 1280, 1}, {3, 3, 1280, 1280}, GGML_TYPE_F16, 1, 1, 1, 1));
+        test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 320, 1, 1}, {1, 1, 1, 1}));
+        test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {4096, 320, 1, 1}, false, {1, 0, 2, 3}));
+        test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {64, 64, 320, 1}, 32));
+        test_cases.emplace_back(new test_group_norm_affine({64, 64, 320, 1}, 32, true));
+        test_cases.emplace_back(new test_norm_affine({320, 4096, 1, 1}));
+        test_cases.emplace_back(new test_norm_affine({2048, 1536, 1, 1}));  // Anima adaLN
+        test_cases.emplace_back(new test_mul_mat_bias(GGML_TYPE_F16, GGML_TYPE_F16, 4096, 320, 2880, 64));
+        test_cases.emplace_back(new test_mul_mat_bias(GGML_TYPE_F16, GGML_TYPE_F32, 320, 4096, 320));
+        return test_cases;
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

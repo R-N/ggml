@@ -13,6 +13,8 @@ struct vk_mat_mat_push_constants {
     uint32_t k_split;
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
     uint32_t padded_N;
+    uint32_t bias_base; uint32_t bias_div; uint32_t bias_len;
+    uint32_t epi;
 };
 
 struct vk_mat_vec_push_constants {
@@ -471,6 +473,12 @@ struct vk_op_rope_apply_push_constants {
 };
 
 static_assert(sizeof(vk_op_rope_apply_push_constants) == 64, "rope_apply push constant layout mismatch");
+
+struct vk_op_rms_norm_rope_apply_push_constants {
+    vk_op_rope_apply_push_constants rope;
+    uint32_t w_offset;
+    float eps;
+};
 
 struct vk_op_rope_push_constants {
     uint32_t rope_mode;

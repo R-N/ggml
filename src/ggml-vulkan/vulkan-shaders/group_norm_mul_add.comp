@@ -1,0 +1,67 @@
+#version 450
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#define BLOCK_SIZE 512
+
+// group_norm(x) * w[c] + b[c], optionally followed by silu.
+// KX = group size, KY = elements per channel, param1 = eps, param2 = channel count, param3 = apply silu
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer W {A_TYPE data_w[];};
+layout (binding = 2) readonly buffer B {A_TYPE data_b[];};
+layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
+
+shared float tmp[BLOCK_SIZE];
+
+float reduce_sum(const uint tid, const float v) {
+    tmp[tid] = v;
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            tmp[tid] += tmp[tid + s];
+        }
+        barrier();
+    }
+    const float r = tmp[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    const uint group_size = p.KX;
+    const uint channel_size = p.KY;
+    const float eps = p.param1;
+    const uint n_channels = uint(p.param2);
+    const bool do_silu = p.param3 != 0.0f;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint start = gl_WorkGroupID.x * group_size + tid;
+    const uint end = (gl_WorkGroupID.x + 1) * group_size;
+
+    float sum = 0.0f;
+    [[unroll]] for (uint col = start; col < end; col += BLOCK_SIZE) {
+        sum += float(data_a[col]);
+    }
+    const float mean = reduce_sum(tid, sum) / group_size;
+
+    float sum_sq = 0.0f;
+    [[unroll]] for (uint col = start; col < end; col += BLOCK_SIZE) {
+        const float xi = float(data_a[col]) - mean;
+        sum_sq += xi * xi;
+    }
+    const float scale = inversesqrt(reduce_sum(tid, sum_sq) / group_size + eps);
+
+    [[unroll]] for (uint col = start; col < end; col += BLOCK_SIZE) {
+        const uint c = (col / channel_size) % n_channels;
+        float v = (float(data_a[col]) - mean) * scale * float(data_w[c]) + float(data_b[c]);
+        if (do_silu) {
+            v = v / (1.0f + exp(-v));
+        }
+        data_d[col] = D_TYPE(v);
+    }
+}

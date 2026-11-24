@@ -23,116 +23,101 @@ layout (push_constant) uniform parameter
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 
-const uint NUM_ITER = 512 / BLOCK_SIZE;
+// A workgroup transposes a tile of TILE output rows (flattened batch/oh/ow) x TILE CHW columns through shared
+// memory: reads walk along ow, so neighbouring threads read neighbouring input pixels, and writes walk along CHW.
+#define TILE 64
+#define WG_SIZE 256
+#define ROW_STEP (WG_SIZE / TILE)
 
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+#if D_SIZE == 2 && !BDA
+layout (binding = 1) writeonly buffer D2 {f16vec2 data_d2[];};
+#endif
 
 #if BDA
 layout (buffer_reference, buffer_reference_align = D_SIZE) buffer D_ptr {D_TYPE d;};
 #endif
 
-void im2col(const uint ow, const uint z_idx) {
-    const uint oh = z_idx % p.OH;
-    const uint batch_idx = z_idx / p.OH;
-
-    const uint gidx = gl_LocalInvocationID.x;
-    const uint src_batch = batch_idx * p.batch_offset;
-    const BDA_OFFSET_T dst_row = ((BDA_OFFSET_T(batch_idx) * p.OH + oh) * p.OW + ow) * p.CHW;
-
-    const uint KHKW = p.KH * p.KW;
-
-    // Precompute base input coordinates
-    const int base_iw = int(ow * p.s0) - p.p0;
-    const int base_ih = int(oh * p.s1) - p.p1;
-
-    // Precompute step deltas
-    const uint delta_ic  = BLOCK_SIZE / KHKW;
-    const uint delta_rem = BLOCK_SIZE % KHKW;
-
-    const uint delta_ky  = delta_rem / p.KW;
-    const uint delta_kx  = delta_rem % p.KW;
-
-    const uint delta_ic_offset = delta_ic * p.offset_delta;
-
-    // If using BDA mode, precompute the base pointer  and step size
-#if BDA
-    const BDA_STORAGE_T base_dst_addr = p.dst_addr + D_SIZE * dst_row;
-    const uint bda_step = D_SIZE * BLOCK_SIZE;
-#endif
-
-    uint wg_x = gl_WorkGroupID.x;
-    do {
-        const uint wg_offset = wg_x * 512;
-
-        uint chw_idx = wg_offset + gidx;
-
-        uint ic  = chw_idx / KHKW;
-        uint rem = chw_idx % KHKW;
-
-        uint ky  = rem / p.KW;
-        uint kx  = rem % p.KW;
-
-        uint ic_offset = src_batch + ic * p.offset_delta;
-
-        // Initialize running pointer/index for the destination buffer
-#if BDA
-        BDA_STORAGE_T current_dst_addr = base_dst_addr + D_SIZE * chw_idx;
-#else
-        uint current_dst_idx = dst_row + chw_idx;
-#endif
-
-        [[unroll]] for (uint i = 0; i < NUM_ITER; ++i) {
-            if (chw_idx >= p.CHW) {
-                return;
-            }
-
-            const int iiw = base_iw + int(kx * p.d0);
-            const int iih = base_ih + int(ky * p.d1);
-
-            A_TYPE val = A_TYPE(0);
-            if (uint(iih) < p.IH && uint(iiw) < p.IW) {
-                val = data_a[ic_offset + uint(iih) * p.IW + uint(iiw)];
-            }
-
-#if BDA
-            D_ptr(current_dst_addr).d = D_TYPE(val);
-            current_dst_addr += bda_step;
-#else
-            data_d[current_dst_idx] = D_TYPE(val);
-            current_dst_idx += BLOCK_SIZE;
-#endif
-
-            chw_idx   += BLOCK_SIZE;
-            ic_offset += delta_ic_offset;
-            kx        += delta_kx;
-            ky        += delta_ky;
-
-            // Handle X axis wrap
-            uint kx_wrap = uint(kx >= p.KW);
-            kx          -= kx_wrap * p.KW;
-            ky          += kx_wrap;
-
-            // Handle Y axis wrap
-            uint ky_wrap = uint(ky >= p.KH);
-            ky          -= ky_wrap * p.KH;
-            ic_offset   += ky_wrap * p.offset_delta;
-        }
-
-        wg_x += gl_NumWorkGroups.x;
-    } while (wg_x * 512 < p.CHW);
-}
+shared A_TYPE tile[TILE * (TILE + 1)];
 
 void main() {
-    uint ow = gl_GlobalInvocationID.y;
-    while (ow < p.OW) {
-        uint z = gl_GlobalInvocationID.z;
-        while (z < p.OH_batch) {
-            im2col(ow, z);
-            z += gl_NumWorkGroups.z;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint KHKW = p.KH * p.KW;
+    const uint n_rows = p.OH_batch * p.OW;
+    const uint delta_ic = ROW_STEP / KHKW;
+    const uint delta_ky = (ROW_STEP % KHKW) / p.KW;
+    const uint delta_kx = (ROW_STEP % KHKW) % p.KW;
+
+    for (uint r0 = gl_WorkGroupID.y * TILE; r0 < n_rows; r0 += gl_NumWorkGroups.y * TILE) {
+        const uint r = r0 + tid % TILE;
+        const uint ow = r % p.OW;
+        const uint oh = (r / p.OW) % p.OH;
+        const uint batch_idx = r / (p.OW * p.OH);
+        const int base_iw = int(ow * p.s0) - p.p0;
+        const int base_ih = int(oh * p.s1) - p.p1;
+        const uint src_batch = batch_idx * p.batch_offset;
+
+        for (uint c0 = gl_WorkGroupID.x * TILE; c0 < p.CHW; c0 += gl_NumWorkGroups.x * TILE) {
+            uint chw = c0 + tid / TILE;
+            uint ic  = chw / KHKW;
+            uint rem = chw % KHKW;
+            uint ky  = rem / p.KW;
+            uint kx  = rem % p.KW;
+            [[unroll]] for (uint i = 0; i < TILE * TILE / WG_SIZE; ++i) {
+                A_TYPE val = A_TYPE(0);
+                const int iih = base_ih + int(ky * p.d1);
+                const int iiw = base_iw + int(kx * p.d0);
+                if (r < n_rows && chw < p.CHW && uint(iih) < p.IH && uint(iiw) < p.IW) {
+                    val = data_a[src_batch + ic * p.offset_delta + uint(iih) * p.IW + uint(iiw)];
+                }
+                tile[(tid / TILE + i * ROW_STEP) * (TILE + 1) + tid % TILE] = val;
+
+                chw += ROW_STEP;
+                kx  += delta_kx;
+                ky  += delta_ky;
+                ic  += delta_ic;
+                const uint kx_wrap = uint(kx >= p.KW);
+                kx -= kx_wrap * p.KW;
+                ky += kx_wrap;
+                const uint ky_wrap = uint(ky >= p.KH);
+                ky -= ky_wrap * p.KH;
+                ic += ky_wrap;
+            }
+            barrier();
+
+#if D_SIZE == 2 && !BDA
+            // pairs of halves keep the stores 32-bit wide
+            if (p.CHW % 2 == 0) {
+                const uint cl = 2 * (tid % (TILE / 2));
+                const uint chw_w = c0 + cl;
+                [[unroll]] for (uint i = 0; i < TILE * TILE / (2 * WG_SIZE); ++i) {
+                    const uint rl = tid / (TILE / 2) + i * (2 * ROW_STEP);
+                    if (r0 + rl < n_rows && chw_w < p.CHW) {
+                        data_d2[((r0 + rl) * p.CHW + chw_w) / 2] =
+                            f16vec2(vec2(tile[cl * (TILE + 1) + rl], tile[(cl + 1) * (TILE + 1) + rl]));
+                    }
+                }
+                barrier();
+                continue;
+            }
+#endif
+            const uint chw_w = c0 + tid % TILE;
+            [[unroll]] for (uint i = 0; i < TILE * TILE / WG_SIZE; ++i) {
+                const uint rl = tid / TILE + i * ROW_STEP;
+                if (r0 + rl < n_rows && chw_w < p.CHW) {
+                    const BDA_OFFSET_T dst_idx = BDA_OFFSET_T(r0 + rl) * p.CHW + chw_w;
+                    const float v = float(tile[(tid % TILE) * (TILE + 1) + rl]);
+#if BDA
+                    D_ptr(p.dst_addr + D_SIZE * dst_idx).d = D_TYPE(v);
+#else
+                    data_d[dst_idx] = D_TYPE(v);
+#endif
+                }
+            }
+            barrier();
         }
-        ow += gl_NumWorkGroups.y;
     }
 }

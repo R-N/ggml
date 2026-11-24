@@ -1,0 +1,85 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// rms_norm -> mul(weight) -> rope_apply in one pass, one workgroup per (head, token) row.
+// The sum of squares and the per-element arithmetic follow rms_norm_small_f32 and rope_apply.comp,
+// so the result matches the unfused ops. The f16 variant also takes in a following cast (k for flash attention).
+
+#define BLOCK_SIZE 64
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X { float data_x[]; };
+layout(binding = 1) readonly buffer W { float data_w[]; };
+layout(binding = 2) readonly buffer PE { float data_pe[]; };
+layout(binding = 3) writeonly buffer D { D_TYPE data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint half_dim;
+    uint heads;
+    uint tokens;
+    uint pairs;
+    uint x_stride[4];
+    uint pe_stride[4];
+    uint x_offset;
+    uint pe_offset;
+    uint dst_offset;
+    uint interleaved;
+    uint w_offset;
+    float eps;
+} pc;
+
+shared float sumsh[BLOCK_SIZE];
+
+void main() {
+    const uint head  = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint batch = gl_WorkGroupID.z;
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint ncols = 2*pc.half_dim;
+
+    const uint x_row = pc.x_offset + head*pc.x_stride[1] + token*pc.x_stride[2] + batch*pc.x_stride[3];
+
+    float sum = 0.0f;
+    for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        const float xi = data_x[x_row + col*pc.x_stride[0]];
+        sum += xi * xi;
+    }
+    sumsh[tid] = sum;
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+    sum = sumsh[0];
+
+    const float mean  = sum / float(ncols);
+    const float scale = inversesqrt(mean + pc.eps);
+
+    const uint out_row = pc.dst_offset + ((batch*pc.heads + head)*pc.tokens + token)*ncols;
+    for (uint j = tid; j < pc.half_dim; j += BLOCK_SIZE) {
+        const uint i0 = pc.interleaved != 0 ? 2*j : j;
+        const uint i1 = pc.interleaved != 0 ? 2*j + 1 : j + pc.half_dim;
+        const float a = scale * data_x[x_row + i0*pc.x_stride[0]] * data_w[pc.w_offset + i0];
+        const float b = scale * data_x[x_row + i1*pc.x_stride[0]] * data_w[pc.w_offset + i1];
+        const uint matrix = pc.pe_offset + j*pc.pe_stride[2] + token*pc.pe_stride[3];
+        const float c = data_pe[matrix];
+        const float s = data_pe[matrix + pc.pe_stride[1]];
+        precise float y0;
+        precise float y1;
+        if (pc.interleaved != 0) {
+            y0 = a*c + b*data_pe[matrix + pc.pe_stride[0]];
+            y1 = a*s + b*data_pe[matrix + pc.pe_stride[0] + pc.pe_stride[1]];
+        } else {
+            y0 = a*c - b*s;
+            y1 = a*s + b*c;
+        }
+        data_d[out_row + i0] = D_TYPE(y0);
+        data_d[out_row + i1] = D_TYPE(y1);
+    }
+}

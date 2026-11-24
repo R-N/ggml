@@ -1,0 +1,31 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// gelu of a contiguous f32 tensor written as f16 (the input of an f16 matmul), four values per thread;
+// the arithmetic is op_gelu from unary.comp, so the result equals gelu followed by a cast
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { vec4 data_a[]; };
+layout(binding = 1) writeonly buffer D { f16vec4 data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint n4;
+} p;
+
+float op_gelu(float x) {
+    const float GELU_COEF_A    = 0.044715f;
+    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+    const float val = SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x);
+    return 0.5f*x*(2.0f - 2.0f / (exp(2.0f * val) + 1.0f));
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (i >= p.n4) {
+        return;
+    }
+    const vec4 v = data_a[i];
+    data_d[i] = f16vec4(op_gelu(v.x), op_gelu(v.y), op_gelu(v.z), op_gelu(v.w));
+}

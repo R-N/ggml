@@ -1,3 +1,5 @@
+#define MM_EPI_TILED 4u
+
 // k_pair is the K coordinate measured in FLOAT_TYPEV2 elements.
 uint a_shmem_index(uint m, uint k_pair) {
     if (APPLY_SLM_A_RESHAPE) {
@@ -21,7 +23,15 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
     if (ALIGNED != 0) {
+#if defined(DATA_A_F16) && !defined(MUL_MAT_ID)
+        uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+        if (TILED_CAP != 0 && (p.epi & MM_EPI_TILED) != 0) {
+            // 64 x BK tiles, tile-major: tile = (row block of 64) * (K / BK) + k block
+            idx = ((((idx_m >> 6) * (p.K / BK) + block / BK) * 64 + (idx_m & 63)) * BK) / LOAD_VEC_A + row;
+        }
+#else
         const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+#endif
         const uint k_pair = row * LOAD_VEC_A / 2;
         FLOAT_TYPEV8 aa = FLOAT_TYPEV8(data_a[idx]);
         store_a(col, k_pair,     aa[0].xy);
@@ -32,7 +42,14 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     }
 #elif LOAD_VEC_A == 4
     if (ALIGNED != 0) {
+#if defined(DATA_A_F16) && !defined(MUL_MAT_ID)
+        uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+        if (TILED_CAP != 0 && (p.epi & MM_EPI_TILED) != 0) {
+            idx = ((((idx_m >> 6) * (p.K / BK) + block / BK) * 64 + (idx_m & 63)) * BK) / LOAD_VEC_A + row;
+        }
+#else
         const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+#endif
         const uint k_pair = row * LOAD_VEC_A / 2;
         FLOAT_TYPEV4 aa = FLOAT_TYPEV4(data_a[idx]);
         store_a(col, k_pair,     aa.xy);
@@ -480,13 +497,12 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 2;
 
-        const uint ib = idx / 128;                   // 2 values per idx
-        const uint iqs = idx % 128;                  // 0..127
+        const uint ib = idx / 64;                    // 4 values per idx
+        const uint iqs = (idx % 64) * 2;             // 0,2,4..126: the first of two pairs sharing the scale
 
         const uint n = iqs / 64;                     // 0,1
-        const uint qsi = n * 32 + (iqs % 16) * 2;    // 0,2,4..62
-        const uint hmi =          (iqs % 16) * 2;    // 0,2,4..30
-        const uint j = (iqs % 64) / 4;               // 0..3
+        const uint qsi = n * 32 + (iqs % 16) * 2;    // 0,4,8..60
+        const uint hmi =          (iqs % 16) * 2;    // 0,4,8..28
         const uint is = iqs / 8;                     // 0..15
         const uint halfsplit = ((iqs % 64) / 16);    // 0,1,2,3
         const uint qsshift = halfsplit * 2;          // 0,2,4,6
@@ -495,11 +511,17 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                 | (((a_q3_k.data[ib].scales[8 + (is % 4)] >> (2 * int(is / 4))) & 3) << 4));
         const float dl = float(a_q3_k.data[ib].d) * float(us - 32);
 
-        const vec2 qs = vec2(unpack8((uint(a_q3_k_p16.data[ib].qs[qsi / 2]) >> qsshift) & 0x0303).xy);
-        const vec2 hm = vec2(unpack8(((uint(a_q3_k_p16.data[ib].hmask[hmi / 2]) >> (4 * n + halfsplit)) & 0x0101 ^ 0x0101) << 2).xy);
+        const uint qw0 = uint(a_q3_k_p16.data[ib].qs[qsi / 2]);
+        const uint qw1 = uint(a_q3_k_p16.data[ib].qs[qsi / 2 + 1]);
+        const uint hw0 = uint(a_q3_k_p16.data[ib].hmask[hmi / 2]);
+        const uint hw1 = uint(a_q3_k_p16.data[ib].hmask[hmi / 2 + 1]);
+        const vec4 qs = vec4(vec2(unpack8((qw0 >> qsshift) & 0x0303).xy), vec2(unpack8((qw1 >> qsshift) & 0x0303).xy));
+        const vec4 hm = vec4(vec2(unpack8(((hw0 >> (4 * n + halfsplit)) & 0x0101 ^ 0x0101) << 2).xy),
+                             vec2(unpack8(((hw1 >> (4 * n + halfsplit)) & 0x0101 ^ 0x0101) << 2).xy));
+        const vec4 v = dl * (qs - hm);
 
-        store_a(col, k_pair, FLOAT_TYPEV2(dl * (qs.x - hm.x),
-                                        dl * (qs.y - hm.y)));
+        store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
+        store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
 
     } else if (MmTypeA == GGML_TYPE_Q4_K) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;

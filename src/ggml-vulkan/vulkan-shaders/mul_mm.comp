@@ -63,6 +63,7 @@ uint mm_load_vec_a() {
     case GGML_TYPE_Q5_0:
     case GGML_TYPE_Q8_0:
     case GGML_TYPE_Q2_K:
+    case GGML_TYPE_Q3_K:
     case GGML_TYPE_Q4_K:
     case GGML_TYPE_Q5_K:
         return 4u;
@@ -125,6 +126,9 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer RowMap {uint data_row_map[];};
+#else
+layout (binding = 3) readonly buffer Bias {float data_bias[];};
+layout (binding = 4) readonly buffer Resid {float data_resid[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -155,6 +159,13 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint padded_N;
+    // bias[((flat output index + bias_base) / bias_div) % bias_len] is added to the output, bias_len == 0 disables it
+    uint bias_base;
+    uint bias_div;
+    uint bias_len;
+    // fused epilogue: out = (acc + bias) or (acc * gate), plus resid; see MM_EPI_* in ggml-vulkan.cpp
+    uint epi;
 #endif
 } p;
 
@@ -168,6 +179,7 @@ layout (constant_id = 7) const uint TM = 4;
 layout (constant_id = 8) const uint TN = 2;
 layout (constant_id = 9) const uint TK = 1;  // Only needed for coopmat
 layout (constant_id = 10) const uint WARP = 32;
+layout (constant_id = 15) const uint TILED_CAP = 0;  // set when the process opted in to tiled F16 weights (SD_VK_TILE=1)
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #define BK 32
@@ -206,6 +218,9 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #ifdef MULMAT_QUANT
 #include "iq_shmem_init.glsl"
 #endif
+
+#define MM_EPI_GATE  1u
+#define MM_EPI_RESID 2u
 
 void main() {
 #ifdef MUL_MAT_ID
@@ -519,11 +534,25 @@ void main() {
                         data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
                     }
 #else
+                    const uint d_idx = offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr;
+                    vec2 v = vec2(sums[sums_idx]);
+                    // with split_k only the first partial carries additive terms; the reduce sums the partials
+                    // (the gate is linear, so every partial is scaled)
+                    if (p.bias_len != 0) {
+                        const vec2 bv = vec2(data_bias[((d_idx + p.bias_base) / p.bias_div) % p.bias_len],
+                                             data_bias[((d_idx + p.bias_base + 1) / p.bias_div) % p.bias_len]);
+                        if ((p.epi & MM_EPI_GATE) != 0) {
+                            v *= bv;
+                        } else if (ik == 0) {
+                            v += bv;
+                        }
+                    }
+                    const bool resid = (p.epi & MM_EPI_RESID) != 0 && ik == 0;
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
+                        data_d[d_idx] = D_TYPE(v.x + (resid ? data_resid[d_idx] : 0.0f));
                     }
                     if (dr_warp + 2 * cr + 1 < p.M && dc_warp + cc < p.N) {
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
+                        data_d[d_idx + 1] = D_TYPE(v.y + (resid ? data_resid[d_idx + 1] : 0.0f));
                     }
 #endif // MUL_MAT_ID
                 }

@@ -227,7 +227,7 @@ void init_indices()
 }
 
 // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
-bool fa_kv_index(uint lin, out uint kv_col) {
+bool fa_kv_index_c(const bool check, uint lin, out uint kv_col) {
     if (USE_SPARSE) {
         if (lin >= p.split_kv) {
             kv_col = 0;
@@ -238,7 +238,11 @@ bool fa_kv_index(uint lin, out uint kv_col) {
         return idx >= 0;
     }
     kv_col = lin;
-    return !KV_bounds_check || lin < KV;
+    return !check || lin < KV;
+}
+
+bool fa_kv_index(uint lin, out uint kv_col) {
+    return fa_kv_index_c(KV_bounds_check, lin, kv_col);
 }
 
 // Bias applied to softmax to stay in fp16 range.
